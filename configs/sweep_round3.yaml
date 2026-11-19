@@ -1,0 +1,5 @@
+# Ronda 3: refinamiento alrededor de la mejor configuración regularizada de la ronda 2
+r3_reg_lr1e4:  ["train.logq_correction=true", "train.learning_rate=0.0001", "train.weight_decay=0.0001", "model.dropout=0.3"]
+r3_reg_b4096:  ["train.logq_correction=true", "train.batch_size=4096", "train.learning_rate=0.001", "train.weight_decay=0.0001", "model.dropout=0.3"]
+r3_reg_t015:   ["train.logq_correction=true", "train.temperature=0.15", "train.learning_rate=0.0003", "train.weight_decay=0.0001", "model.dropout=0.3"]
+r3_reg_nopop:  ["train.logq_correction=true", "model.use_popularity_feature=false", "train.learning_rate=0.0003", "train.weight_decay=0.0001", "model.dropout=0.3"]

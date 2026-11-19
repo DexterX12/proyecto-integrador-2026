@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Datos crudos y artefactos generados (se regeneran con el pipeline)
+*.jsonl
+data/
+spark-warehouse/
+metastore_db/
+derby.log

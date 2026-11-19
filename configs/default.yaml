@@ -1,0 +1,86 @@
+﻿# FashRec - configuración versionada del pipeline.
+# Cualquier valor se puede sobreescribir por CLI:  --set train.epochs=5 model.embedding_dim=128
+
+paths:
+  # Raíz del "data lake" local. Replica el layout de S3 (curated/, model_data/, artifacts/, ...).
+  # Se puede sobreescribir con la variable de entorno FASHREC_DATA_ROOT.
+  data_root: data
+  raw_reviews: Amazon_Fashion.jsonl
+  raw_metadata: meta_Amazon_Fashion.jsonl
+
+etl:
+  spark_master: "local[10]"
+  driver_memory: 14g
+  shuffle_partitions: 48
+  max_description_chars: 1500
+  max_review_future_ms: 0          # 0 = sin validar fecha futura
+
+protocol:
+  dataset_version: v1
+  relevance_threshold: 4.0         # relevante <=> rating >= 4 (equivale a "rating > 3" de L3AE)
+  # Cortes temporales globales (UTC). train < val_start <= validation < test_start <= test
+  val_start: "2021-01-01"
+  test_start: "2021-10-01"
+  history_len: 20                  # últimos N productos positivos usados como historial
+  # Universo candidato: ítems con >= N interacciones (cualquier rating) en train.
+  # El k-core estricto (k>=3) deja <0.2 % de los datos en este dataset; ver reports/kcore_analysis.json
+  item_min_train_interactions: 1
+  # Un ítem recibe embedding de ID propio solo con >= N interacciones en train (el resto usa OOV).
+  item_id_min_train_interactions: 2
+  # Un user_id recibe embedding propio solo si tiene >= N positivos en train; el resto usa el índice OOV.
+  user_id_min_train_positives: 2
+  # Usuarios con recomendaciones precalculadas: >= N positivos en el historial (+ usuarios de evaluación)
+  min_history_for_recs: 2
+
+features:
+  text_fields: [title]             # opciones: title, features_text, description_text
+  tfidf_ngram_max: 2
+  tfidf_max_features: 40000
+  tfidf_min_df: 3
+  svd_dim: 64
+  store_vocab_size: 3000
+  store_min_train_items: 3
+  random_seed: 42
+
+baselines:
+  popularity_min_reviews: 5        # mínimo de reseñas en train para entrar al ranking de popularidad
+  itemknn_max_history: 20
+  itemknn_neighbors: 100
+  itemknn_shrink: 10.0
+
+model:
+  embedding_dim: 64                # dimensión del espacio compartido usuario/producto
+  id_emb_dim: 64
+  cat_emb_dim: 16
+  store_emb_dim: 16
+  hidden_dims: [256]
+  dropout: 0.3
+  emb_init_std: 0.1
+  similarity: cosine               # cosine | dot
+  use_popularity_feature: true     # log(1+interacciones en train) como feature de la torre de producto
+  user_id_dropout: 0.3             # prob. de reemplazar user_id por OOV durante entrenamiento
+  item_id_dropout: 0.2
+
+train:
+  batch_size: 1024
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  epochs: 20
+  patience: 3
+  temperature: 0.1
+  logq_correction: true            # elegido por barrido en validación (sin logQ el modelo no aprende)
+  min_history_len: 1               # 0 = cargar también ejemplos sin historial previo
+  empty_history_frac: 0.0          # fracción por época de los ejemplos sin historial (requiere min_history_len=0)
+  val_users: 0                     # 0 = toda la validación para elegir checkpoint
+  early_stopping_metric: ndcg@20
+  random_seed: 42
+  num_threads: 10
+
+retrieval:
+  top_n: 50                        # recomendaciones precalculadas por usuario
+  index_type: flat_ip              # exacto; ver sección 5.7 del plan
+  eval_ks: [5, 10, 20]
+
+
+
+

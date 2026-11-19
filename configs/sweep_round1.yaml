@@ -1,0 +1,7 @@
+# Ronda 1: ¿qué ingredientes hacen que el Two-Tower supere a popularidad en VALIDACIÓN?
+r1_cos_base:        ["model.similarity=cosine", "train.temperature=0.1", "train.logq_correction=false"]
+r1_cos_logq:        ["model.similarity=cosine", "train.temperature=0.1", "train.logq_correction=true"]
+r1_dot_t1:          ["model.similarity=dot", "train.temperature=1.0", "train.logq_correction=false"]
+r1_cos_t05_logq:    ["model.similarity=cosine", "train.temperature=0.05", "train.logq_correction=true"]
+r1_cos_logq_nouid:  ["model.similarity=cosine", "train.logq_correction=true", "model.user_id_dropout=1.0"]
+r1_cos_logq_lowid:  ["model.similarity=cosine", "train.logq_correction=true", "model.user_id_dropout=0.6", "model.item_id_dropout=0.5"]
