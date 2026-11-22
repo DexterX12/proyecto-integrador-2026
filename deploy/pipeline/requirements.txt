@@ -1,0 +1,12 @@
+# Dependencias de la imagen del pipeline (etapas features, train, evaluate, recommend, publish, export, load).
+# torch se instala aparte (build CPU) en el Dockerfile. Sin pyspark: el ETL corre en AWS Glue, no aquí.
+# Versiones = las del entorno local con el que se validó el pipeline.
+numpy==2.4.6
+pandas==3.1.1
+pyarrow==26.0.1
+scipy==1.17.1
+scikit-learn==1.9.1
+faiss-cpu==1.16.0
+umap-learn==0.6.0
+pyyaml==6.0.3
+boto3==1.44.9

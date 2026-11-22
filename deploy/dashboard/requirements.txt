@@ -1,0 +1,9 @@
+# Dependencias de la imagen del dashboard (sin PyTorch ni PySpark). Versiones = las del entorno local.
+numpy==2.4.6
+pandas==3.1.1
+pyarrow==26.0.1
+duckdb==2.0.0
+faiss-cpu==1.16.0
+streamlit==1.67.0
+plotly==7.1.0
+pyyaml==6.0.3

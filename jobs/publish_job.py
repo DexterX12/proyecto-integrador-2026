@@ -15,7 +15,7 @@ from src.common.config import add_common_args, load_config
 from src.common.lake import Lake, ensure
 from src.common.runlog import run_log
 from src.data.dataset import ModelData
-from src.data.ingestion import verify_raw_manifest
+from src.data.ingestion import verify_raw_manifest, verify_raw_manifest_s3
 from src.evaluation.evaluate import check_index_consistency
 from src.models.train import load_model
 from src.retrieval.faiss_index import FlatIPIndex
@@ -36,11 +36,13 @@ def validate_candidate(cfg, lake, md, version: str, require_beat_baseline: bool 
     add("artefactos existen", all((art / f).exists() for f in
                                   ("model.pt", "config.json", "faiss.index", "training_history.csv")), art)
     manifest = lake.reports / "raw_manifest.json"
-    if manifest.exists():
+    if not manifest.exists():
+        add("datos RAW sin modificar", False, "falta raw_manifest.json")
+    elif (raw_manifest := _read(manifest)).get("storage") == "s3":          # ejecución en AWS (ver ingestion.py)
+        add("datos RAW sin modificar (tamaño, ETag y versión en S3)", verify_raw_manifest_s3(raw_manifest))
+    else:
         ok = verify_raw_manifest({"reviews": lake.raw("raw_reviews"), "metadata": lake.raw("raw_metadata")}, manifest)
         add("datos RAW sin modificar (SHA-256)", ok)
-    else:
-        add("datos RAW sin modificar (SHA-256)", False, "falta raw_manifest.json")
     try:
         model, config = load_model(lake, md, version)
         add("checkpoint coincide con config.json y protocolo", True, config["checkpoint_sha1"][:12])
@@ -149,6 +151,9 @@ def main(argv=None) -> dict | None:
     with run_log("publish", lake, {"model_version": args.model_version}) as run:
         report = publish(cfg, lake, md, args.model_version, not args.no_baseline_gate, args.force)
         run.metric("passed", report["passed"])
+    if not report["passed"] and not args.force:
+        # Código de salida distinto de 0: run_pipeline y Step Functions detectan que NO se publicó.
+        sys.exit(1)
     return report
 
 

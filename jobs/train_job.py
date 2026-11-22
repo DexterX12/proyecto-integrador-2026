@@ -30,6 +30,9 @@ def main(argv=None) -> str:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
     parser.add_argument("--tag", default=None, help="Sufijo opcional de la versión del modelo")
+    parser.add_argument("--model-version", default=None,
+                        help="Fija la versión (Step Functions la decide antes de lanzar las tareas); "
+                             "sin este argumento se genera por fecha")
     parser.add_argument("--no-export", action="store_true",
                         help="Modo ajuste: entrena y guarda solo el resultado en reports/sweeps/<tag>.json")
     args = parser.parse_args(argv)
@@ -38,7 +41,7 @@ def main(argv=None) -> str:
     md = ModelData(lake, cfg)
     if args.no_export:
         return run_tuning(cfg, lake, md, args)
-    version = new_model_version(lake, args.tag)
+    version = args.model_version or new_model_version(lake, args.tag)
     lake.artifacts(version).mkdir(parents=True, exist_ok=True)
 
     with run_log("train", lake, {"model_version": version, "overrides": args.overrides}) as run:

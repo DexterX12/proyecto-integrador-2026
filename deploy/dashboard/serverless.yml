@@ -1,0 +1,92 @@
+# Servicio 4/4: dashboard Streamlit en ECS Fargate, sin balanceador (IP pública restringida a una IP).
+# Streamlit necesita WebSockets: App Runner no los soporta.
+# Despliegue (apagado por defecto), con variables de entorno:
+#   FASHREC_VPC_ID=vpc-xxxx FASHREC_SUBNET_ID=subnet-xxxx FASHREC_ALLOWED_CIDR=203.0.113.10/32 serverless deploy --stage dev
+# Encender para una demostración:   aws ecs update-service --cluster fashrec-dev --service fashrec-dev-dashboard --desired-count 1
+# Apagar:                           ... --desired-count 0
+service: fashrec-dashboard
+frameworkVersion: ">=3"
+
+provider:
+  name: aws
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+
+custom:
+  prefix: fashrec-${self:provider.stage}
+
+resources:
+  Resources:
+    DashboardSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: FashRec dashboard (solo la IP indicada, puerto 8501)
+        VpcId: ${env:FASHREC_VPC_ID}
+        SecurityGroupIngress:
+          - { IpProtocol: tcp, FromPort: 8501, ToPort: 8501, CidrIp: "${env:FASHREC_ALLOWED_CIDR}" }
+
+    DashboardLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /fashrec/${self:provider.stage}/dashboard
+        RetentionInDays: 14
+
+    DashboardTaskRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefix}-dashboard-task
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: "sts:AssumeRole" }
+        Policies:
+          - PolicyName: read-lake
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ["s3:ListBucket"]
+                  Resource: arn:aws:s3:::${cf:fashrec-platform-${self:provider.stage}.BucketName}
+                - Effect: Allow
+                  Action: ["s3:GetObject"]
+                  Resource: arn:aws:s3:::${cf:fashrec-platform-${self:provider.stage}.BucketName}/*
+
+    DashboardTask:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: ${self:custom.prefix}-dashboard
+        RequiresCompatibilities: [FARGATE]
+        NetworkMode: awsvpc
+        Cpu: "1024"
+        Memory: "2048"
+        EphemeralStorage: { SizeInGiB: 30 }          # los datos sincronizados al arrancar (~0.4 GB) caben de sobra
+        ExecutionRoleArn: ${cf:fashrec-platform-${self:provider.stage}.EcsExecutionRoleArn}
+        TaskRoleArn: !GetAtt DashboardTaskRole.Arn
+        ContainerDefinitions:
+          - Name: dashboard
+            Image: ${cf:fashrec-platform-${self:provider.stage}.DashboardRepositoryUri}:latest
+            Essential: true
+            PortMappings: [{ ContainerPort: 8501 }]
+            Environment:
+              - { Name: DATA_BUCKET, Value: "${cf:fashrec-platform-${self:provider.stage}.BucketName}" }
+              - { Name: FASHREC_DATA_ROOT, Value: /data }
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref DashboardLogGroup
+                awslogs-region: ${self:provider.region}
+                awslogs-stream-prefix: dashboard
+
+    DashboardService:
+      Type: AWS::ECS::Service
+      Properties:
+        ServiceName: ${self:custom.prefix}-dashboard
+        Cluster: ${cf:fashrec-platform-${self:provider.stage}.ClusterName}
+        LaunchType: FARGATE
+        DesiredCount: ${env:FASHREC_DASHBOARD_DESIRED, 0}              # apagado por defecto: costo cero fuera de las demostraciones
+        TaskDefinition: !Ref DashboardTask
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            Subnets: ["${env:FASHREC_SUBNET_ID}"]
+            SecurityGroups: [!Ref DashboardSecurityGroup]
+            AssignPublicIp: ENABLED

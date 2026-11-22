@@ -6,7 +6,15 @@ __pycache__/
 
 # Datos crudos y artefactos generados (se regeneran con el pipeline)
 *.jsonl
-data/
+/data/
 spark-warehouse/
 metastore_db/
 derby.log
+
+# Serverless Framework
+.serverless/
+node_modules/
+
+# Artefactos generados por deploy/deploy.ps1
+deploy/build/
+deploy/api/layer/

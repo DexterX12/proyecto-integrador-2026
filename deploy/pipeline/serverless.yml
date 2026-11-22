@@ -1,0 +1,334 @@
+# Servicio 2/4: pipeline batch = Glue (ETL Spark) + tareas Fargate + máquina de estados de Step Functions.
+# Requiere fashrec-platform. Variables de entorno obligatorias del despliegue (el framework no admite opciones CLI propias):
+#   FASHREC_VPC_ID=vpc-xxxx FASHREC_SUBNET_ID=subnet-xxxx serverless deploy --stage dev
+# Ejecución:  aws stepfunctions start-execution --state-machine-arn <PipelineArn> --input '{"model_version":"20261201_1000_aws"}'
+service: fashrec-pipeline
+frameworkVersion: ">=3"
+
+provider:
+  name: aws
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+
+custom:
+  prefix: fashrec-${self:provider.stage}
+  platform: fashrec-platform-${self:provider.stage}
+  image: ${cf:fashrec-platform-${self:provider.stage}.PipelineRepositoryUri}:latest
+  # --- bloques reutilizados en la máquina de estados (anclas YAML)
+  net: &net
+    AwsvpcConfiguration:
+      Subnets: ["${env:FASHREC_SUBNET_ID}"]
+      SecurityGroups: [{ Ref: PipelineSecurityGroup }]
+      AssignPublicIp: ENABLED
+  fail: &fail
+    - ErrorEquals: ["States.ALL"]
+      ResultPath: $.error
+      Next: NotifyFailure
+
+resources:
+  Resources:
+    PipelineSecurityGroup:                       # sin reglas de entrada: las tareas solo salen a S3/ECR/DynamoDB
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: FashRec pipeline tasks (sin entrada)
+        VpcId: ${env:FASHREC_VPC_ID}
+
+    # ------------------------------------------------------------------ Glue (ETL distribuido)
+    EtlJob:
+      Type: AWS::Glue::Job
+      Properties:
+        Name: ${self:custom.prefix}-etl
+        Role: ${cf:fashrec-platform-${self:provider.stage}.GlueJobRoleArn}
+        GlueVersion: "5.0"                       # probar 6.0 (30 % más barato) cuando el ETL esté validado en él
+        WorkerType: G.1X
+        NumberOfWorkers: 10
+        Timeout: 60
+        MaxRetries: 0
+        Command:
+          Name: glueetl
+          PythonVersion: "3"
+          ScriptLocation: s3://${cf:fashrec-platform-${self:provider.stage}.BucketName}/glue-scripts/glue_etl_job.py
+        DefaultArguments:
+          --extra-py-files: s3://${cf:fashrec-platform-${self:provider.stage}.BucketName}/glue-scripts/fashrec_src.zip
+          --extra-files: s3://${cf:fashrec-platform-${self:provider.stage}.BucketName}/glue-scripts/default.yaml
+          --additional-python-modules: pyyaml
+          --DATA_BUCKET: ${cf:fashrec-platform-${self:provider.stage}.BucketName}
+          --enable-metrics: "true"
+          --enable-continuous-cloudwatch-log: "true"
+          --TempDir: s3://${cf:fashrec-platform-${self:provider.stage}.BucketName}/glue-tmp/
+
+    # ------------------------------------------------------------------ Fargate: una imagen, tres tamaños
+    TaskSmall:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: ${self:custom.prefix}-small
+        RequiresCompatibilities: [FARGATE]
+        NetworkMode: awsvpc
+        Cpu: "2048"
+        Memory: "8192"
+        ExecutionRoleArn: ${cf:fashrec-platform-${self:provider.stage}.EcsExecutionRoleArn}
+        TaskRoleArn: ${cf:fashrec-platform-${self:provider.stage}.PipelineTaskRoleArn}
+        ContainerDefinitions:
+          - &container
+            Name: pipeline
+            Image: ${self:custom.image}
+            Essential: true
+            Environment:
+              - { Name: DATA_BUCKET, Value: "${cf:fashrec-platform-${self:provider.stage}.BucketName}" }
+              - { Name: TABLE_PREFIX, Value: "${self:custom.prefix}" }
+              - { Name: ACTIVE_VERSION_PARAM, Value: "${cf:fashrec-platform-${self:provider.stage}.ActiveVersionParam}" }
+              - { Name: AWS_DEFAULT_REGION, Value: "${self:provider.region}" }
+              - { Name: FASHREC_DATA_ROOT, Value: /data }
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: ${cf:fashrec-platform-${self:provider.stage}.LogGroupName}
+                awslogs-region: ${self:provider.region}
+                awslogs-stream-prefix: small
+
+    TaskMedium:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: ${self:custom.prefix}-medium
+        RequiresCompatibilities: [FARGATE]
+        NetworkMode: awsvpc
+        Cpu: "8192"
+        Memory: "32768"
+        ExecutionRoleArn: ${cf:fashrec-platform-${self:provider.stage}.EcsExecutionRoleArn}
+        TaskRoleArn: ${cf:fashrec-platform-${self:provider.stage}.PipelineTaskRoleArn}
+        ContainerDefinitions:
+          - <<: *container
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: ${cf:fashrec-platform-${self:provider.stage}.LogGroupName}
+                awslogs-region: ${self:provider.region}
+                awslogs-stream-prefix: medium
+
+    TaskLarge:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: ${self:custom.prefix}-large
+        RequiresCompatibilities: [FARGATE]
+        NetworkMode: awsvpc
+        Cpu: "16384"
+        Memory: "65536"
+        ExecutionRoleArn: ${cf:fashrec-platform-${self:provider.stage}.EcsExecutionRoleArn}
+        TaskRoleArn: ${cf:fashrec-platform-${self:provider.stage}.PipelineTaskRoleArn}
+        ContainerDefinitions:
+          - <<: *container
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: ${cf:fashrec-platform-${self:provider.stage}.LogGroupName}
+                awslogs-region: ${self:provider.region}
+                awslogs-stream-prefix: large
+
+    # ------------------------------------------------------------------ Step Functions
+    StateMachineRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefix}-sfn
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - { Effect: Allow, Principal: { Service: states.amazonaws.com }, Action: "sts:AssumeRole" }
+        Policies:
+          - PolicyName: run-pipeline
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"]
+                  Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${self:custom.prefix}-etl"
+                - Effect: Allow
+                  Action: ["ecs:RunTask"]
+                  Resource:
+                    - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${self:custom.prefix}-*"
+                - Effect: Allow
+                  Action: ["ecs:StopTask", "ecs:DescribeTasks"]
+                  Resource: "*"
+                - Effect: Allow
+                  Action: ["iam:PassRole"]
+                  Resource:
+                    - ${cf:fashrec-platform-${self:provider.stage}.EcsExecutionRoleArn}
+                    - ${cf:fashrec-platform-${self:provider.stage}.PipelineTaskRoleArn}
+                - Effect: Allow                   # necesario para las integraciones .sync
+                  Action: ["events:PutTargets", "events:PutRule", "events:DescribeRule"]
+                  Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+                - Effect: Allow
+                  Action: ["events:PutTargets", "events:PutRule", "events:DescribeRule"]
+                  Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventForGlueJobsRule"
+                - Effect: Allow
+                  Action: ["sns:Publish"]
+                  Resource: ${cf:fashrec-platform-${self:provider.stage}.TopicArn}
+
+    PipelineStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: ${self:custom.prefix}-pipeline
+        StateMachineType: STANDARD
+        RoleArn: !GetAtt StateMachineRole.Arn
+        DefinitionSubstitutions:
+          Cluster: ${cf:fashrec-platform-${self:provider.stage}.ClusterName}
+          EtlJob: !Ref EtlJob
+          TaskSmall: !Ref TaskSmall
+          TaskMedium: !Ref TaskMedium
+          TaskLarge: !Ref TaskLarge
+          TopicArn: ${cf:fashrec-platform-${self:provider.stage}.TopicArn}
+        Definition:
+          Comment: "FashRec: ETL (Glue) -> features -> train -> evaluate -> recommend -> publish -> carga de serving"
+          StartAt: ETL
+          States:
+            ETL:
+              Type: Task
+              Resource: arn:aws:states:::glue:startJobRun.sync
+              Parameters: { JobName: '\${EtlJob}' }
+              ResultPath: null
+              Catch: *fail
+              Next: Features
+            Features:
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskMedium}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command: [python, -m, jobs.features_job]
+                      Environment: [{ Name: STAGE, Value: features }]
+              ResultPath: null
+              Catch: *fail
+              Next: Train
+            Train:
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskLarge}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command.$: "States.Array('python','-m','jobs.train_job','--model-version',$.model_version)"
+                      Environment:
+                        - { Name: STAGE, Value: train }
+                        - { Name: MODEL_VERSION, Value.$: $.model_version }
+              ResultPath: null
+              Catch: *fail
+              Next: Evaluate
+            Evaluate:
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskMedium}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command.$: "States.Array('python','-m','jobs.evaluate_job','--model-version',$.model_version,'--splits','validation','test')"
+                      Environment:
+                        - { Name: STAGE, Value: evaluate }
+                        - { Name: MODEL_VERSION, Value.$: $.model_version }
+              ResultPath: null
+              Catch: *fail
+              Next: Recommend
+            Recommend:
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskLarge}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command.$: "States.Array('python','-m','jobs.recommend_job','--model-version',$.model_version)"
+                      Environment:
+                        - { Name: STAGE, Value: recommend }
+                        - { Name: MODEL_VERSION, Value.$: $.model_version }
+              ResultPath: null
+              Catch: *fail
+              Next: Publish
+            Publish:
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskSmall}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command.$: "States.Array('python','-m','jobs.publish_job','--model-version',$.model_version)"
+                      Environment:
+                        - { Name: STAGE, Value: publish }
+                        - { Name: MODEL_VERSION, Value.$: $.model_version }
+              ResultPath: null
+              Catch: *fail
+              Next: Export
+            Export:                                   # paquete de inferencia (NumPy + FAISS) que usa la Lambda POST /v1/recommend
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskSmall}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command.$: "States.Array('python','-m','jobs.export_inference_bundle','--model-version',$.model_version)"
+                      Environment:
+                        - { Name: STAGE, Value: export }
+                        - { Name: MODEL_VERSION, Value.$: $.model_version }
+              ResultPath: null
+              Catch: *fail
+              Next: LoadServing
+            LoadServing:
+              Type: Task
+              Resource: arn:aws:states:::ecs:runTask.sync
+              Parameters:
+                Cluster: '\${Cluster}'
+                TaskDefinition: '\${TaskSmall}'
+                LaunchType: FARGATE
+                NetworkConfiguration: *net
+                Overrides:
+                  ContainerOverrides:
+                    - Name: pipeline
+                      Command.$: "States.Array('python','-m','jobs.load_serving_job','--model-version',$.model_version)"
+                      Environment:
+                        - { Name: STAGE, Value: load }
+                        - { Name: MODEL_VERSION, Value.$: $.model_version }
+              ResultPath: null
+              Catch: *fail
+              Next: NotifySuccess
+            NotifySuccess:
+              Type: Task
+              Resource: arn:aws:states:::sns:publish
+              Parameters:
+                TopicArn: '\${TopicArn}'
+                Message.$: "States.Format('FashRec: version {} publicada', $.model_version)"
+              End: true
+            NotifyFailure:
+              Type: Task
+              Resource: arn:aws:states:::sns:publish
+              Parameters:
+                TopicArn: '\${TopicArn}'
+                Message.$: "States.Format('FashRec: el pipeline fallo ({}). La version publicada anterior sigue activa.', $.error.Error)"
+              Next: Failed
+            Failed:
+              Type: Fail
+              Error: PipelineFailed
+
+  Outputs:
+    PipelineArn: { Value: !Ref PipelineStateMachine }
+    EtlJobName:  { Value: !Ref EtlJob }

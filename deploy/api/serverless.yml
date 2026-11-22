@@ -1,0 +1,103 @@
+# Servicio 3/4: API de recomendaciones (Lambda + API Gateway HTTP API).
+#   GET  /v1/health
+#   GET  /v1/recommendations/{user_id}?n=10     -> DynamoDB (precalculado) o fallback por popularidad
+#   POST /v1/recommend  {"history":[...],"n":10} -> modelo Two-Tower (NumPy + FAISS), sin PyTorch
+# Requiere el servicio fashrec-platform ya desplegado. Despliegue: serverless deploy --stage dev
+service: fashrec-api
+frameworkVersion: ">=3"
+
+provider:
+  name: aws
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  runtime: python3.13
+  architecture: x86_64
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 14
+  environment:
+    DATA_BUCKET: ${cf:fashrec-platform-${self:provider.stage}.BucketName}
+    ACTIVE_VERSION_PARAM: ${cf:fashrec-platform-${self:provider.stage}.ActiveVersionParam}
+    TABLE_PREFIX: fashrec-${self:provider.stage}
+  httpApi:
+    name: fashrec-${self:provider.stage}
+    cors:
+      allowedOrigins: ["*"]
+      allowedMethods: [GET, POST, OPTIONS]
+      allowedHeaders: [content-type, x-api-key]
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action: ssm:GetParameter
+          Resource: arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter/fashrec-${self:provider.stage}/*
+        - Effect: Allow
+          Action: [dynamodb:GetItem, dynamodb:BatchGetItem]
+          Resource:
+            - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/fashrec-${self:provider.stage}-recs-*
+            - arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/fashrec-${self:provider.stage}-products
+        - Effect: Allow
+          Action: s3:GetObject
+          Resource: arn:aws:s3:::${cf:fashrec-platform-${self:provider.stage}.BucketName}/inference/*
+
+layers:
+  numpyFaiss:
+    path: layer                                     # layer/python/ lo genera deploy/api/build_layer.ps1
+    name: fashrec-${self:provider.stage}-numpy-faiss
+    description: numpy + faiss-cpu (manylinux, Python 3.13)
+    compatibleRuntimes: [python3.13]
+    retain: false
+    package:
+      patterns: ["python/**"]
+
+package:
+  individually: true
+  patterns:
+    - "!**"
+
+functions:
+  lookup:
+    handler: handlers/lookup.handler
+    description: Top-N precalculado desde DynamoDB
+    memorySize: 128
+    timeout: 5
+    package:
+      patterns: ["handlers/lookup.py"]
+    events:
+      - httpApi:
+          method: GET
+          path: /v1/health
+      - httpApi:
+          method: GET
+          path: "/v1/recommendations/{user_id}"
+
+  recommend:
+    handler: handlers/infer.handler
+    description: Inferencia con la torre de usuario (NumPy) y búsqueda FAISS
+    memorySize: 1536
+    timeout: 29
+    ephemeralStorageSize: 1024                      # /tmp para el paquete de inferencia (~170 MB)
+    layers:
+      - { Ref: NumpyFaissLambdaLayer }
+    package:
+      patterns: ["handlers/infer.py"]
+    events:
+      - httpApi:
+          method: POST
+          path: /v1/recommend
+
+resources:
+  Resources:
+    # Límite de tasa de la etapa por defecto (HTTP API no tiene API keys ni planes de uso).
+    HttpApiStage:
+      Type: AWS::ApiGatewayV2::Stage
+      Properties:
+        ApiId: { Ref: HttpApi }
+        StageName: $default
+        AutoDeploy: true
+        DefaultRouteSettings:
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+  Outputs:
+    ApiUrl:
+      Value: { "Fn::Join": ["", ["https://", { Ref: HttpApi }, ".execute-api.${self:provider.region}.amazonaws.com"]] }

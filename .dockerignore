@@ -1,0 +1,17 @@
+# El contexto de build solo necesita src/, jobs/, app/, configs/ y deploy/*/ (entrypoint y requirements).
+# Los datos (GBs) NUNCA deben entrar al contexto ni a la imagen.
+.git
+.venv
+.pytest_cache
+**/__pycache__
+**/*.pyc
+data
+*.jsonl
+spark-warehouse
+metastore_db
+derby.log
+node_modules
+**/.serverless
+deploy/api/layer
+deploy/**/*.zip
+*.md

@@ -1,0 +1,302 @@
+# Servicio 1/4: plataforma de datos (S3, Glue Data Catalog, Athena, DynamoDB, ECR, ECS, IAM, SNS, SSM).
+# Sin funciones Lambda: el Serverless Framework solo aprovisiona los recursos (CloudFormation).
+# Despliegue:  serverless deploy --stage dev     (ver DEPLOYMENT_SERVERLESS.md)
+service: fashrec-platform
+frameworkVersion: ">=3"
+
+provider:
+  name: aws
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  # A diferencia de lo habitual en un servicio con Lambdas, aquí no se necesita runtime.
+
+custom:
+  bucket: fashrec-data-${aws:accountId}-${self:provider.region}-${self:provider.stage}
+  prefix: fashrec-${self:provider.stage}
+
+resources:
+  Resources:
+    # ------------------------------------------------------------------ S3: data lake por zonas
+    DataBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain                    # protege los datos si se borra la pila por error
+      UpdateReplacePolicy: Retain
+      Properties:
+        BucketName: ${self:custom.bucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+        VersioningConfiguration: { Status: Enabled }
+        LifecycleConfiguration:
+          Rules:
+            - Id: athena-results-expire
+              Status: Enabled
+              Prefix: athena-results/
+              ExpirationInDays: 14
+            - Id: old-versions-expire
+              Status: Enabled
+              NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+    # ------------------------------------------------------------------ Glue Data Catalog + Athena
+    GlueDatabase:
+      Type: AWS::Glue::Database
+      Properties:
+        CatalogId: !Ref AWS::AccountId
+        DatabaseInput:
+          Name: fashrec_${self:provider.stage}
+
+    InteractionsTable:
+      Type: AWS::Glue::Table
+      Properties:
+        CatalogId: !Ref AWS::AccountId
+        DatabaseName: !Ref GlueDatabase
+        TableInput:
+          Name: interactions
+          TableType: EXTERNAL_TABLE
+          Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.review_year.type: integer
+            projection.review_year.range: "2000,2023"
+            storage.location.template: s3://${self:custom.bucket}/curated/interactions/review_year=\${review_year}
+          PartitionKeys:
+            - { Name: review_year, Type: int }
+          StorageDescriptor:
+            Location: s3://${self:custom.bucket}/curated/interactions/
+            InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+            OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+            SerdeInfo:
+              SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Columns:
+              - { Name: user_id, Type: string }
+              - { Name: parent_asin, Type: string }
+              - { Name: rating, Type: double }
+              - { Name: timestamp, Type: bigint }
+              - { Name: n_reviews, Type: bigint }
+              - { Name: verified_purchase, Type: boolean }
+
+    ProductsTable:
+      Type: AWS::Glue::Table
+      Properties:
+        CatalogId: !Ref AWS::AccountId
+        DatabaseName: !Ref GlueDatabase
+        TableInput:
+          Name: products
+          TableType: EXTERNAL_TABLE
+          Parameters: { classification: parquet }
+          StorageDescriptor:
+            Location: s3://${self:custom.bucket}/curated/products/
+            InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+            OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+            SerdeInfo:
+              SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Columns:
+              - { Name: parent_asin, Type: string }
+              - { Name: title, Type: string }
+              - { Name: store, Type: string }
+              - { Name: price, Type: double }
+              - { Name: product_type, Type: string }
+              - { Name: audience, Type: string }
+              - { Name: features_text, Type: string }
+              - { Name: description_text, Type: string }
+              - { Name: image_url, Type: string }
+              - { Name: image_hi_res, Type: string }
+              - { Name: n_images, Type: int }
+              - { Name: meta_average_rating, Type: double }
+              - { Name: meta_rating_number, Type: bigint }
+
+    RecommendationsTable:
+      Type: AWS::Glue::Table
+      Properties:
+        CatalogId: !Ref AWS::AccountId
+        DatabaseName: !Ref GlueDatabase
+        TableInput:
+          Name: recommendations
+          TableType: EXTERNAL_TABLE
+          Parameters:
+            classification: parquet
+            projection.enabled: "true"
+            projection.model_version.type: injected
+            storage.location.template: s3://${self:custom.bucket}/recommendations/model_version=\${model_version}/recs
+          PartitionKeys:
+            - { Name: model_version, Type: string }
+          StorageDescriptor:
+            Location: s3://${self:custom.bucket}/recommendations/
+            InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+            OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+            SerdeInfo:
+              SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Columns:
+              - { Name: user_id, Type: string }
+              - { Name: rank, Type: smallint }
+              - { Name: item_idx, Type: int }
+              - { Name: parent_asin, Type: string }
+              - { Name: score, Type: float }
+
+    AthenaWorkGroup:
+      Type: AWS::Athena::WorkGroup
+      Properties:
+        Name: ${self:custom.prefix}
+        State: ENABLED
+        RecursiveDeleteOption: true                      # sin esto, el historial de consultas de Athena impide borrar el workgroup
+        WorkGroupConfiguration:
+          EnforceWorkGroupConfiguration: true
+          BytesScannedCutoffPerQuery: 1073741824          # tope de 1 GB escaneado por consulta
+          ResultConfiguration:
+            OutputLocation: s3://${self:custom.bucket}/athena-results/
+
+    # ------------------------------------------------------------------ DynamoDB (serving por clave)
+    ProductsDynamoTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.prefix}-products
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: parent_asin, AttributeType: S }
+        KeySchema:
+          - { AttributeName: parent_asin, KeyType: HASH }
+        SSESpecification: { SSEEnabled: true }
+
+    # Las tablas de recomendaciones (una por versión de modelo) las crea load_serving_job en cada ejecución.
+
+    # ------------------------------------------------------------------ versión activa y avisos
+    ActiveVersionParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: /${self:custom.prefix}/active_version
+        Type: String
+        Value: none
+        Description: model_version servida por la API (la actualiza load_serving_job)
+
+    NotificationsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:custom.prefix}-pipeline
+
+    # ------------------------------------------------------------------ contenedores y cómputo
+    PipelineRepository:
+      Type: AWS::ECR::Repository
+      Properties:
+        RepositoryName: ${self:custom.prefix}-pipeline
+        LifecyclePolicy:
+          LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"conservar 5","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+
+    DashboardRepository:
+      Type: AWS::ECR::Repository
+      Properties:
+        RepositoryName: ${self:custom.prefix}-dashboard
+        LifecyclePolicy:
+          LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"conservar 5","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+
+    EcsCluster:
+      Type: AWS::ECS::Cluster
+      Properties:
+        ClusterName: ${self:custom.prefix}
+
+    PipelineLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /fashrec/${self:provider.stage}/pipeline
+        RetentionInDays: 14
+
+    # ------------------------------------------------------------------ IAM (mínimo privilegio)
+    EcsExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefix}-ecs-exec
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: "sts:AssumeRole" }
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+    PipelineTaskRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefix}-pipeline-task
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - { Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: "sts:AssumeRole" }
+        Policies:
+          - PolicyName: pipeline-data
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ["s3:ListBucket"]
+                  Resource: !GetAtt DataBucket.Arn
+                - Effect: Allow
+                  Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+                  Resource:
+                    - !Sub "${DataBucket.Arn}/curated/*"
+                    - !Sub "${DataBucket.Arn}/model_data/*"
+                    - !Sub "${DataBucket.Arn}/artifacts/*"
+                    - !Sub "${DataBucket.Arn}/recommendations/*"
+                    - !Sub "${DataBucket.Arn}/evaluation/*"
+                    - !Sub "${DataBucket.Arn}/published/*"
+                    - !Sub "${DataBucket.Arn}/reports/*"
+                    - !Sub "${DataBucket.Arn}/runs/*"
+                    - !Sub "${DataBucket.Arn}/inference/*"
+                - Effect: Allow                       # publish_job comprueba el tamaño/ETag de los JSONL (sin descargarlos)
+                  Action: ["s3:GetObject"]
+                  Resource: !Sub "${DataBucket.Arn}/raw/*"
+                - Effect: Allow
+                  Action: ["dynamodb:CreateTable", "dynamodb:DescribeTable", "dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:GetItem"]
+                  Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${self:custom.prefix}-*"
+                - Effect: Allow
+                  Action: ["ssm:PutParameter", "ssm:GetParameter"]
+                  Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${self:custom.prefix}/*"
+
+    GlueJobRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefix}-glue
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - { Effect: Allow, Principal: { Service: glue.amazonaws.com }, Action: "sts:AssumeRole" }
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        Policies:
+          - PolicyName: glue-data
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ["s3:ListBucket"]
+                  Resource: !GetAtt DataBucket.Arn
+                - Effect: Allow
+                  Action: ["s3:GetObject"]
+                  Resource:
+                    - !Sub "${DataBucket.Arn}/raw/*"
+                    - !Sub "${DataBucket.Arn}/glue-scripts/*"
+                - Effect: Allow
+                  Action: ["s3:PutObject", "s3:DeleteObject"]
+                  Resource:
+                    - !Sub "${DataBucket.Arn}/curated/*"
+                    - !Sub "${DataBucket.Arn}/reports/*"
+                    - !Sub "${DataBucket.Arn}/runs/*"
+                    - !Sub "${DataBucket.Arn}/glue-tmp/*"
+
+  Outputs:
+    BucketName:            { Value: !Ref DataBucket,  Export: { Name: "${self:custom.prefix}-bucket" } }
+    BucketArn:             { Value: !GetAtt DataBucket.Arn, Export: { Name: "${self:custom.prefix}-bucket-arn" } }
+    GlueDatabaseName:      { Value: !Ref GlueDatabase }
+    AthenaWorkGroupName:   { Value: !Ref AthenaWorkGroup }
+    ProductsTableName:     { Value: !Ref ProductsDynamoTable, Export: { Name: "${self:custom.prefix}-products-table" } }
+    ActiveVersionParam:    { Value: !Ref ActiveVersionParameter, Export: { Name: "${self:custom.prefix}-active-version-param" } }
+    TopicArn:              { Value: !Ref NotificationsTopic, Export: { Name: "${self:custom.prefix}-topic" } }
+    PipelineRepositoryUri: { Value: !GetAtt PipelineRepository.RepositoryUri }
+    DashboardRepositoryUri: { Value: !GetAtt DashboardRepository.RepositoryUri }
+    ClusterName:           { Value: !Ref EcsCluster, Export: { Name: "${self:custom.prefix}-cluster" } }
+    LogGroupName:          { Value: !Ref PipelineLogGroup, Export: { Name: "${self:custom.prefix}-log-group" } }
+    EcsExecutionRoleArn:   { Value: !GetAtt EcsExecutionRole.Arn, Export: { Name: "${self:custom.prefix}-ecs-exec-role" } }
+    PipelineTaskRoleArn:   { Value: !GetAtt PipelineTaskRole.Arn, Export: { Name: "${self:custom.prefix}-task-role" } }
+    GlueJobRoleArn:        { Value: !GetAtt GlueJobRole.Arn, Export: { Name: "${self:custom.prefix}-glue-role" } }
