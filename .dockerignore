@@ -15,3 +15,6 @@ node_modules
 deploy/api/layer
 deploy/**/*.zip
 *.md
+
+# Credenciales: nunca deben entrar al contexto de build
+.env*

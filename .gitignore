@@ -18,3 +18,8 @@ node_modules/
 # Artefactos generados por deploy/deploy.ps1
 deploy/build/
 deploy/api/layer/
+
+# Credenciales y configuración local del despliegue (usa .env.example como plantilla)
+.env
+.env.*
+!.env.example

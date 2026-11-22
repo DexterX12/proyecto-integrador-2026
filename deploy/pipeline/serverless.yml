@@ -111,8 +111,11 @@ resources:
         Family: ${self:custom.prefix}-large
         RequiresCompatibilities: [FARGATE]
         NetworkMode: awsvpc
-        Cpu: "16384"
-        Memory: "65536"
+        # 8 vCPU / 32 GB: el máximo que cabe en la cuota de Fargate por defecto (12 vCPU). Con 16 vCPU
+        # ECS rechaza la tarea con "reached the limit on the number of vCPUs". El entrenamiento en CPU
+        # va algo más lento pero no falla. Si subes la cuota a >=16, puedes volver a "16384"/"65536".
+        Cpu: "8192"
+        Memory: "32768"
         ExecutionRoleArn: ${cf:fashrec-platform-${self:provider.stage}.EcsExecutionRoleArn}
         TaskRoleArn: ${cf:fashrec-platform-${self:provider.stage}.PipelineTaskRoleArn}
         ContainerDefinitions:
@@ -184,7 +187,7 @@ resources:
               Type: Task
               Resource: arn:aws:states:::glue:startJobRun.sync
               Parameters: { JobName: '\${EtlJob}' }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: Features
             Features:
@@ -200,7 +203,7 @@ resources:
                     - Name: pipeline
                       Command: [python, -m, jobs.features_job]
                       Environment: [{ Name: STAGE, Value: features }]
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: Train
             Train:
@@ -218,7 +221,7 @@ resources:
                       Environment:
                         - { Name: STAGE, Value: train }
                         - { Name: MODEL_VERSION, Value.$: $.model_version }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: Evaluate
             Evaluate:
@@ -236,7 +239,7 @@ resources:
                       Environment:
                         - { Name: STAGE, Value: evaluate }
                         - { Name: MODEL_VERSION, Value.$: $.model_version }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: Recommend
             Recommend:
@@ -254,7 +257,7 @@ resources:
                       Environment:
                         - { Name: STAGE, Value: recommend }
                         - { Name: MODEL_VERSION, Value.$: $.model_version }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: Publish
             Publish:
@@ -272,7 +275,7 @@ resources:
                       Environment:
                         - { Name: STAGE, Value: publish }
                         - { Name: MODEL_VERSION, Value.$: $.model_version }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: Export
             Export:                                   # paquete de inferencia (NumPy + FAISS) que usa la Lambda POST /v1/recommend
@@ -290,7 +293,7 @@ resources:
                       Environment:
                         - { Name: STAGE, Value: export }
                         - { Name: MODEL_VERSION, Value.$: $.model_version }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: LoadServing
             LoadServing:
@@ -308,7 +311,7 @@ resources:
                       Environment:
                         - { Name: STAGE, Value: load }
                         - { Name: MODEL_VERSION, Value.$: $.model_version }
-              ResultPath: null
+              ResultPath: $.taskResult
               Catch: *fail
               Next: NotifySuccess
             NotifySuccess:

@@ -69,13 +69,20 @@ def put_json(bucket: str, key: str, payload: dict) -> str:
     return f"s3://{bucket}/{key}"
 
 
-def find_config() -> Path:
-    from pyspark import SparkFiles
-
-    for p in (Path("default.yaml"), Path(SparkFiles.get("default.yaml"))):
+def find_config(sc=None) -> Path:
+    """Localiza default.yaml. `--extra-files` lo copia al directorio de trabajo del driver; como respaldo
+    se consulta SparkFiles, que EXIGE un SparkContext ya creado (si no, lanza AssertionError)."""
+    candidates = [Path("default.yaml"), Path.cwd() / "default.yaml"]
+    if sc is not None:
+        try:
+            from pyspark import SparkFiles
+            candidates.append(Path(SparkFiles.get("default.yaml")))
+        except Exception:  # noqa: BLE001  (SparkFiles puede fallar según el modo de ejecución)
+            pass
+    for p in candidates:
         if p.exists():
             return p
-    raise FileNotFoundError("default.yaml no llegó al job (argumento --extra-files)")
+    raise FileNotFoundError(f"default.yaml no llegó al job (argumento --extra-files). Buscado en: {candidates}")
 
 
 def main() -> None:
@@ -92,13 +99,13 @@ def main() -> None:
     args = getResolvedOptions(sys.argv, ["JOB_NAME", "DATA_BUCKET"])
     bucket = args["DATA_BUCKET"]
     setup_logging()
-    cfg = load_config(find_config())
 
-    sc = SparkContext.getOrCreate()
+    sc = SparkContext.getOrCreate()             # SparkFiles.get() en find_config() necesita el contexto ya creado
     glue = GlueContext(sc)
     spark = glue.spark_session
     job = Job(glue)
     job.init(args["JOB_NAME"], args)
+    cfg = load_config(find_config(sc))
     for key, value in {"spark.sql.session.timeZone": "UTC", "spark.sql.ansi.enabled": "false",
                        "spark.sql.shuffle.partitions": str(cfg.etl.shuffle_partitions)}.items():
         spark.conf.set(key, value)

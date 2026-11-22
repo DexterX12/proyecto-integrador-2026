@@ -277,13 +277,13 @@ resources:
                   Resource:
                     - !Sub "${DataBucket.Arn}/raw/*"
                     - !Sub "${DataBucket.Arn}/glue-scripts/*"
+                # Escritura en todo el bucket: EMRFS crea marcadores de carpeta "<prefijo>_$folder$" en la raíz
+                # (p. ej. "curated_$folder$") que caen fuera de "curated/*". El bucket solo contiene datos de este
+                # proyecto; el rol de Glue ya puede escribir en casi todos los prefijos, así que ampliar a "/*" evita
+                # pelear con cada marcador sin ceder nada sensible. La lectura sigue acotada a raw/ y glue-scripts/.
                 - Effect: Allow
                   Action: ["s3:PutObject", "s3:DeleteObject"]
-                  Resource:
-                    - !Sub "${DataBucket.Arn}/curated/*"
-                    - !Sub "${DataBucket.Arn}/reports/*"
-                    - !Sub "${DataBucket.Arn}/runs/*"
-                    - !Sub "${DataBucket.Arn}/glue-tmp/*"
+                  Resource: !Sub "${DataBucket.Arn}/*"
 
   Outputs:
     BucketName:            { Value: !Ref DataBucket,  Export: { Name: "${self:custom.prefix}-bucket" } }
