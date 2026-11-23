@@ -41,7 +41,7 @@ Los `.jsonl` y la carpeta `data/` no se versionan en git (ver `.gitignore`): se 
 - **Python 3.11+**
 - **Java 17+** (lo necesita PySpark para el ETL local)
 - Dependencias en `requirements.txt` (pipeline completo) y `requirements-app.txt` (solo el dashboard).
-- Para el despliegue en AWS: WSL con Docker, AWS CLI v2 y el Serverless Framework (los instala `deploy/setup_wsl.sh`).
+- Para el despliegue en AWS: WSL con Docker, AWS CLI v2 y el Serverless Framework
 
 ---
 
